@@ -289,6 +289,10 @@ type Peer struct {
 	Started         bool
 	mu              sync.Mutex
 	stopSR          chan struct{}
+	// Trickle ICE candidates that arrive before the remote description is
+	// set can't be applied yet (pion rejects them with "remote description
+	// is not set"); buffer them here and flush once SetAnswer succeeds.
+	pendingCandidates []webrtc.ICECandidateInit
 }
 
 type Sidecar struct {
@@ -826,10 +830,21 @@ func (s *Sidecar) SetAnswer(id, sdp string) error {
 		return nil
 	}
 
-	return peer.PC.SetRemoteDescription(webrtc.SessionDescription{
+	if err := peer.PC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,
-	})
+	}); err != nil {
+		return err
+	}
+
+	pending := peer.pendingCandidates
+	peer.pendingCandidates = nil
+	for _, c := range pending {
+		if err := peer.PC.AddICECandidate(c); err != nil {
+			log.Printf("[Peer %s] Failed to apply buffered ICE candidate: %v", id, err)
+		}
+	}
+	return nil
 }
 
 func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sdpMLineIndex uint16) error {
@@ -840,11 +855,21 @@ func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sd
 		return fmt.Errorf("peer %s not found", id)
 	}
 
-	return peer.PC.AddICECandidate(webrtc.ICECandidateInit{
+	init := webrtc.ICECandidateInit{
 		Candidate:     candidate,
 		SDPMid:        &sdpMid,
 		SDPMLineIndex: &sdpMLineIndex,
-	})
+	}
+
+	peer.mu.Lock()
+	if peer.PC.RemoteDescription() == nil {
+		peer.pendingCandidates = append(peer.pendingCandidates, init)
+		peer.mu.Unlock()
+		return nil
+	}
+	peer.mu.Unlock()
+
+	return peer.PC.AddICECandidate(init)
 }
 
 func (s *Sidecar) ClosePeer(id string) {
