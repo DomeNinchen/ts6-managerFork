@@ -17,6 +17,7 @@ import (
 	"time"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
+	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
@@ -613,6 +614,11 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	portMax := uint16(envIntOrDefault("ICE_UDP_PORT_MAX", 50100))
 	if err := se.SetEphemeralUDPPortRange(portMin, portMax); err != nil {
 		return "", fmt.Errorf("set ICE UDP port range: %w", err)
+	}
+	if debugLogsEnabled() {
+		lf := logging.NewDefaultLoggerFactory()
+		lf.DefaultLogLevel = logging.LogLevelTrace
+		se.LoggerFactory = lf
 	}
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(se))
