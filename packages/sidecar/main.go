@@ -17,21 +17,22 @@ import (
 	"time"
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/intervalpli"
+	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
+// The previous defaults were a handful of individually-run community STUN
+// servers; all 8 stopped responding at some point (verified via a direct
+// STUN binding request), which is why ICE connectivity regressed even
+// though nothing in this repo's code or Docker networking changed.
+// These are established, highly-available public STUN services instead.
 var defaultStunServers = []string{
-	"stun:49.13.204.141:3478",
-	"stun:176.58.93.154:3478",
-	"stun:185.40.234.113:3478",
-	"stun:68.183.90.120:3478",
-	"stun:45.159.97.233:3478",
-	"stun:172.105.166.103:3478",
-	"stun:172.237.28.183:3478",
-	"stun:208.72.155.133:3478",
 	"stun:stun.l.google.com:19302",
+	"stun:stun1.l.google.com:19302",
+	"stun:stun.cloudflare.com:3478",
+	"stun:global.stun.twilio.com:3478",
 }
 
 func getStunServers() []string {
@@ -289,6 +290,10 @@ type Peer struct {
 	Started         bool
 	mu              sync.Mutex
 	stopSR          chan struct{}
+	// Trickle ICE candidates that arrive before the remote description is
+	// set can't be applied yet (pion rejects them with "remote description
+	// is not set"); buffer them here and flush once SetAnswer succeeds.
+	pendingCandidates []webrtc.ICECandidateInit
 }
 
 type Sidecar struct {
@@ -610,6 +615,11 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	if err := se.SetEphemeralUDPPortRange(portMin, portMax); err != nil {
 		return "", fmt.Errorf("set ICE UDP port range: %w", err)
 	}
+	if debugLogsEnabled() {
+		lf := logging.NewDefaultLoggerFactory()
+		lf.DefaultLogLevel = logging.LogLevelTrace
+		se.LoggerFactory = lf
+	}
 
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(se))
 
@@ -826,10 +836,21 @@ func (s *Sidecar) SetAnswer(id, sdp string) error {
 		return nil
 	}
 
-	return peer.PC.SetRemoteDescription(webrtc.SessionDescription{
+	if err := peer.PC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,
-	})
+	}); err != nil {
+		return err
+	}
+
+	pending := peer.pendingCandidates
+	peer.pendingCandidates = nil
+	for _, c := range pending {
+		if err := peer.PC.AddICECandidate(c); err != nil {
+			log.Printf("[Peer %s] Failed to apply buffered ICE candidate: %v", id, err)
+		}
+	}
+	return nil
 }
 
 func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sdpMLineIndex uint16) error {
@@ -840,11 +861,21 @@ func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sd
 		return fmt.Errorf("peer %s not found", id)
 	}
 
-	return peer.PC.AddICECandidate(webrtc.ICECandidateInit{
+	init := webrtc.ICECandidateInit{
 		Candidate:     candidate,
 		SDPMid:        &sdpMid,
 		SDPMLineIndex: &sdpMLineIndex,
-	})
+	}
+
+	peer.mu.Lock()
+	if peer.PC.RemoteDescription() == nil {
+		peer.pendingCandidates = append(peer.pendingCandidates, init)
+		peer.mu.Unlock()
+		return nil
+	}
+	peer.mu.Unlock()
+
+	return peer.PC.AddICECandidate(init)
 }
 
 func (s *Sidecar) ClosePeer(id string) {
