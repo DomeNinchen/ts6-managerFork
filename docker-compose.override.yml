@@ -1,0 +1,3 @@
+networks:
+  ts6-network:
+    external: true

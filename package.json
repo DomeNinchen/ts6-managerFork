@@ -15,6 +15,13 @@
   "devDependencies": {
     "typescript": "^5.4.0"
   },
+  "pnpm": {
+    "overrides": {
+      "form-data": "^4.0.6",
+      "defu": "^6.1.5",
+      "path-to-regexp": "^0.1.13"
+    }
+  },
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"

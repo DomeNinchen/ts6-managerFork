@@ -149,8 +149,16 @@ The backend proxies all TeamSpeak API calls. The frontend never has direct acces
 
 ## Quick Start (Docker)
 
-1. Download the [`docker-compose.yml`](docker-compose.yml)
-2. Create a `.env` file next to it:
+This fork builds its own images from source — there are no prebuilt images on Docker Hub, so `docker-compose.yml` here builds from the `Dockerfile.*` files instead of pulling `clusterzx/ts6-manager:*`.
+
+1. Clone the repo:
+
+```bash
+git clone https://github.com/DomeNinchen/ts6-managerFork.git
+cd ts6-managerFork
+```
+
+2. Create a `.env` file in the repo root:
 
 ```env
 JWT_SECRET=your-random-secret-at-least-32-characters
@@ -164,10 +172,10 @@ echo "JWT_SECRET=$(openssl rand -base64 32)" >> .env
 echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> .env
 ```
 
-3. Start the stack:
+3. Build and start the stack:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 4. Open `http://localhost:3000/setup` and create your admin account
@@ -176,13 +184,9 @@ docker compose up -d
 > `JWT_SECRET` is **required** — the backend will refuse to start in production without it.
 > `ENCRYPTION_KEY` is optional but recommended — if not set, `JWT_SECRET` is used as fallback for credential encryption.
 
-### Building from Source
+For local development instead, use:
 
 ```bash
-git clone https://github.com/clusterzx/ts6-manager.git
-cd ts6-manager
-echo "JWT_SECRET=$(openssl rand -base64 32)" >> .env
-echo "ENCRYPTION_KEY=$(openssl rand -base64 32)" >> .env
 docker compose -f docker-compose.local.yml up -d --build
 ```
 

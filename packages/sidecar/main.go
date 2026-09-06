@@ -1115,7 +1115,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		log.Printf("[API] Setting source: %s (%dx%d @ %dfps)", req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
+		log.Printf("[API] Setting source: %s (%dx%d @ %dfps, %s)", req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
 		sidecar.StartFFmpeg(req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})

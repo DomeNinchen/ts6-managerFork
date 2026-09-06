@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   backend:
-    image: clusterzx/ts6-manager:backend-dev
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
     container_name: ts6-backend-dev
     restart: unless-stopped
     environment:
@@ -27,7 +29,9 @@ services:
       - ts6-network
 
   sidecar:
-    image: clusterzx/ts6-manager:sidecar-dev
+    build:
+      context: .
+      dockerfile: Dockerfile.sidecar
     container_name: ts6-sidecar-dev
     restart: unless-stopped
     environment:
@@ -36,7 +40,9 @@ services:
       - ts6-network
 
   frontend:
-    image: clusterzx/ts6-manager:frontend-dev
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
     container_name: ts6-frontend-dev
     restart: unless-stopped
     ports:

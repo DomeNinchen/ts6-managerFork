@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   backend:
-    image: clusterzx/ts6-manager:backend
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
     container_name: ts6-backend
     restart: unless-stopped
     environment:
@@ -24,7 +26,9 @@ services:
       - coolify-ts
 
   frontend:
-    image: clusterzx/ts6-manager:frontend
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
     container_name: ts6-frontend
     restart: unless-stopped
     depends_on:
