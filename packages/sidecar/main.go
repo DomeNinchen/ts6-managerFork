@@ -22,16 +22,16 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+// The previous defaults were a handful of individually-run community STUN
+// servers; all 8 stopped responding at some point (verified via a direct
+// STUN binding request), which is why ICE connectivity regressed even
+// though nothing in this repo's code or Docker networking changed.
+// These are established, highly-available public STUN services instead.
 var defaultStunServers = []string{
-	"stun:49.13.204.141:3478",
-	"stun:176.58.93.154:3478",
-	"stun:185.40.234.113:3478",
-	"stun:68.183.90.120:3478",
-	"stun:45.159.97.233:3478",
-	"stun:172.105.166.103:3478",
-	"stun:172.237.28.183:3478",
-	"stun:208.72.155.133:3478",
 	"stun:stun.l.google.com:19302",
+	"stun:stun1.l.google.com:19302",
+	"stun:stun.cloudflare.com:3478",
+	"stun:global.stun.twilio.com:3478",
 }
 
 func getStunServers() []string {
