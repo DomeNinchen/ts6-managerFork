@@ -2,7 +2,7 @@
 FROM node:20-slim AS base
 RUN corepack enable && corepack prepare pnpm@9 --activate
 
-# Install system deps: openssl (Prisma), ffmpeg (audio), python3+pip (yt-dlp)
+# Install system deps: openssl (Prisma), ffmpeg (audio), python3+pip (yt-dlp), curl (Deno installer)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       openssl \
@@ -10,9 +10,17 @@ RUN apt-get update && \
       python3 \
       python3-pip \
       ca-certificates \
-    && python3 -m pip install --break-system-packages --no-cache-dir -U "yt-dlp[default]" \ 
+      curl \
+      unzip \
+    && python3 -m pip install --break-system-packages --no-cache-dir -U "yt-dlp[default]" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Deno: yt-dlp's supported JS runtime for solving YouTube's signature/n-parameter challenges
+# (required for combined video+audio format selection used by video streaming; audio-only
+# extraction happens to work without it, which is why this was missed for a while)
+RUN curl -fsSL https://deno.land/install.sh | sh
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
@@ -41,9 +49,7 @@ COPY --from=build /app/packages/backend/package.json ./packages/backend/package.
 COPY --from=build /app/packages/backend/node_modules ./packages/backend/node_modules
 
 WORKDIR /app/packages/backend
-RUN mkdir -p data /data/music && \
-    mkdir -p /root/.config/yt-dlp && \
-    echo "--js-runtimes node" > /root/.config/yt-dlp/config
+RUN mkdir -p data /data/music
 
 EXPOSE 3001
 ENV SIDECAR_URL=http://ts6-sidecar:9800
