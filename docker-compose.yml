@@ -43,6 +43,9 @@ services:
       - SIDECAR_PORT=9800
     ports:
       - "9800:9800"
+      # WebRTC ICE media (video/audio) -- must also be opened in the host
+      # firewall, UDP, both IPv4 and IPv6.
+      - "50000-50100:50000-50100/udp"
     networks:
       - ts6-network
 
