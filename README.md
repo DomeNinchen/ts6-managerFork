@@ -1,6 +1,8 @@
 #### DISCLAIMER: 
 ![AI Assisted](https://img.shields.io/badge/AI%20Assisted-Project-00ADD8?style=for-the-badge&logo=dependabot&logoColor=white)
 
+This is a fork of [clusterzx/ts6-manager](https://github.com/clusterzx/ts6-manager):
+
 # TS6 Manager
 
 Web-based management interface for TeamSpeak servers. Control virtual servers, channels, clients, permissions, music bots, automated workflows, and embeddable server widgets — all from your browser.
@@ -8,6 +10,7 @@ Web-based management interface for TeamSpeak servers. Control virtual servers, c
 Built on the **WebQuery HTTP API** (the ServerQuery replacement in modern TeamSpeak builds). Telnet is not used or supported.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
+
 
 ## Screenshots
 
