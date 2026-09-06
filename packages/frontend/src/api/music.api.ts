@@ -40,8 +40,9 @@ export const musicBotsApi = {
   playerWidgetToken: (id: number) => api.get(`/music-bots/${id}/player-widget-token`).then((r) => r.data),
 
   // Video Streaming
+  // Waits on TS3 setupstream confirmation (up to 10s) plus yt-dlp URL resolution on top
   startStream: (id: number, source: string, preset?: string, framerate?: number, bitrate?: string) =>
-    api.post(`/music-bots/${id}/stream/start`, { source, preset, framerate, bitrate }).then((r) => r.data),
+    api.post(`/music-bots/${id}/stream/start`, { source, preset, framerate, bitrate }, { timeout: 60000 }).then((r) => r.data),
   stopStream: (id: number) => api.post(`/music-bots/${id}/stream/stop`).then((r) => r.data),
   setStreamSource: (id: number, source: string) =>
     api.post(`/music-bots/${id}/stream/source`, { source }).then((r) => r.data),
