@@ -600,7 +600,16 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		return "", err
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+	// Pin ICE candidate gathering to a fixed UDP range so it can be firewalled
+	// (default OS-ephemeral ports can't be opened individually on a real server).
+	se := webrtc.SettingEngine{}
+	portMin := uint16(envIntOrDefault("ICE_UDP_PORT_MIN", 50000))
+	portMax := uint16(envIntOrDefault("ICE_UDP_PORT_MAX", 50100))
+	if err := se.SetEphemeralUDPPortRange(portMin, portMax); err != nil {
+		return "", fmt.Errorf("set ICE UDP port range: %w", err)
+	}
+
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(se))
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: iceServers,
