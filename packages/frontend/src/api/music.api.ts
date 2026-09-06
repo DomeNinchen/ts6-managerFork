@@ -5,7 +5,8 @@ import api from './client';
 export const musicBotsApi = {
   list: () => api.get('/music-bots').then((r) => r.data),
   get: (id: number) => api.get(`/music-bots/${id}`).then((r) => r.data),
-  create: (data: any) => api.post('/music-bots', data).then((r) => r.data),
+  // Identity generation (security level 23) can take well over 15s on slower CPUs
+  create: (data: any) => api.post('/music-bots', data, { timeout: 90000 }).then((r) => r.data),
   update: (id: number, data: any) => api.put(`/music-bots/${id}`, data).then((r) => r.data),
   delete: (id: number) => api.delete(`/music-bots/${id}`),
   start: (id: number) => api.post(`/music-bots/${id}/start`).then((r) => r.data),

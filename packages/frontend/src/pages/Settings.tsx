@@ -202,11 +202,18 @@ function ConnectionsTab() {
                 <span className="font-mono-data">{server.sshPort || '-'}</span>
               </div>
               <div className="flex items-center gap-1 pt-2">
-                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => testServer.mutate(server.id, {
-                  onSuccess: () => toast.success('Connection successful'),
-                  onError: () => toast.error('Connection failed'),
-                })}>
-                  <TestTube className="h-3 w-3 mr-1" /> Test
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  disabled={testServer.isPending && testServer.variables === server.id}
+                  onClick={() => testServer.mutate(server.id, {
+                    onSuccess: (data: any) => data?.success ? toast.success('Connection successful') : toast.error('Connection failed'),
+                    onError: () => toast.error('Connection failed'),
+                  })}
+                >
+                  <TestTube className="h-3 w-3 mr-1" />
+                  {testServer.isPending && testServer.variables === server.id ? 'Testing...' : 'Test'}
                 </Button>
                 <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => openEdit(server)}>
                   <Pencil className="h-3 w-3 mr-1" /> Edit

@@ -31,7 +31,12 @@ export function getYtCookieFile(): string | null {
 }
 
 export function getCookieArgs(): string[] {
-  const args: string[] = ["--remote-components", "ejs:github"];
+  const args: string[] = [
+    "--remote-components", "ejs:github",
+    // Without this, age-restricted/limited videos only expose format 18
+    // (low-quality progressive mp4) via the default player client.
+    "--extractor-args", "youtube:player_client=default,web_music",
+  ];
   if (ytCookieFile) {
     args.push("--cookies", ytCookieFile);
   }
