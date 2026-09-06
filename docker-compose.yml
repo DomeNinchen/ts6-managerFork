@@ -19,13 +19,15 @@ services:
       - JWT_REFRESH_EXPIRY=7d
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
       - MUSIC_DIR=/data/music
-      - SIDECAR_URL=http://ts6-sidecar:9800
+      - SIDECAR_URL=http://host.docker.internal:9800
       - SIDECAR_BINARY_PATH=${SIDECAR_BINARY_PATH:-}
     volumes:
       - backend-data:/app/packages/backend/data
       - music-data:/data/music
       # Optional: mount YouTube cookies file for yt-dlp
       # - ./cookies.txt:/app/cookies.txt
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "3001:3001"
     depends_on:
@@ -33,18 +35,20 @@ services:
     networks:
       - ts6-network
 
+  # network_mode: host -- WebRTC needs raw UDP for ICE media (video/audio),
+  # and pion picks random ephemeral ports with no fixed range configured.
+  # Docker's bridge NAT only forwards ports we explicitly publish, so ICE
+  # from a real external TS3 client can't traverse it (fails/closes).
+  # Host networking bypasses that NAT layer entirely for this container.
   sidecar:
     build:
       context: .
       dockerfile: Dockerfile.sidecar
     container_name: ts6-sidecar
     restart: unless-stopped
+    network_mode: host
     environment:
       - SIDECAR_PORT=9800
-    ports:
-      - "9800:9800"
-    networks:
-      - ts6-network
 
   frontend:
     build:
