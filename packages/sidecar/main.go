@@ -474,7 +474,19 @@ func (s *Sidecar) processVideoRTP() {
 		}
 
 		s.peersLock.RLock()
+		peers := make([]*Peer, 0, len(s.peers))
 		for _, peer := range s.peers {
+			peers = append(peers, peer)
+		}
+		s.peersLock.RUnlock()
+
+		// Forward to all peers concurrently -- with N peers, writing to them
+		// one at a time (SRTP encrypt + syscall each) can add up to more than
+		// one frame interval, which backs up the queue and causes exactly the
+		// packet drops/stutter this is meant to avoid. Only the gate check
+		// (fast, in-memory) stays synchronous.
+		var wg sync.WaitGroup
+		for _, peer := range peers {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
@@ -489,10 +501,14 @@ func (s *Sidecar) processVideoRTP() {
 			peer.mu.Unlock()
 
 			if active && started && track != nil {
-				_ = track.WriteRTP(pkt)
+				wg.Add(1)
+				go func(t *webrtc.TrackLocalStaticRTP) {
+					defer wg.Done()
+					_ = t.WriteRTP(pkt)
+				}(track)
 			}
 		}
-		s.peersLock.RUnlock()
+		wg.Wait()
 	}
 }
 
@@ -512,7 +528,14 @@ func (s *Sidecar) processAudioRTP() {
 		}
 
 		s.peersLock.RLock()
+		peers := make([]*Peer, 0, len(s.peers))
 		for _, peer := range s.peers {
+			peers = append(peers, peer)
+		}
+		s.peersLock.RUnlock()
+
+		var wg sync.WaitGroup
+		for _, peer := range peers {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
@@ -520,10 +543,14 @@ func (s *Sidecar) processAudioRTP() {
 			peer.mu.Unlock()
 
 			if active && started && track != nil {
-				_ = track.WriteRTP(pkt)
+				wg.Add(1)
+				go func(t *webrtc.TrackLocalStaticRTP) {
+					defer wg.Done()
+					_ = t.WriteRTP(pkt)
+				}(track)
 			}
 		}
-		s.peersLock.RUnlock()
+		wg.Wait()
 	}
 }
 
