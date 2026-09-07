@@ -961,6 +961,16 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 
 	args := []string{}
 
+	// ffmpeg's demuxer read-ahead queue defaults to just 8 packets per
+	// input, which is fine for a local file but far too little for a
+	// network source: a brief stall fetching the next chunk over HTTP
+	// drains it immediately, and the encoder has nothing to output on
+	// schedule. That shows up downstream as WebRTC audio/video
+	// concealment and interruptions even though no packets are actually
+	// lost -- they just weren't queued up far enough ahead to absorb the
+	// stall. Bumping it gives ffmpeg's network reader thread real slack.
+	threadQueueSize := strconv.Itoa(envIntOrDefault("THREAD_QUEUE_SIZE", 4096))
+
 	if source != "" {
 		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
 			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
@@ -968,7 +978,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 			args = append(args, "-stream_loop", "-1")
 		}
 
-		args = append(args, "-fflags", "+genpts+discardcorrupt", "-re", "-i", source)
+		args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", source)
 
 		// Video-only and audio-only DASH streams resolved separately (e.g.
 		// YouTube only serves combined formats up to ~360p; better quality
@@ -978,7 +988,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 			if strings.HasPrefix(audioSource, "http://") || strings.HasPrefix(audioSource, "https://") {
 				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
 			}
-			args = append(args, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioSource)
+			args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioSource)
 		}
 	} else {
 		args = append(args, "-re", "-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=1", w, h))
