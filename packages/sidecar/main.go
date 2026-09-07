@@ -916,7 +916,7 @@ func (s *Sidecar) ClosePeer(id string) {
 	s.peersLock.Unlock()
 }
 
-func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate int, bitrate string) {
+func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate int, bitrate string, audioSource string) {
 	s.ffmpegLock.Lock()
 	defer s.ffmpegLock.Unlock()
 
@@ -953,14 +953,30 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		}
 
 		args = append(args, "-fflags", "+genpts+discardcorrupt", "-re", "-i", source)
+
+		// Video-only and audio-only DASH streams resolved separately (e.g.
+		// YouTube only serves combined formats up to ~360p; better quality
+		// needs muxing two URLs), fed to ffmpeg as a second input rather
+		// than upscaling the low-res combined format.
+		if audioSource != "" {
+			if strings.HasPrefix(audioSource, "http://") || strings.HasPrefix(audioSource, "https://") {
+				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+			}
+			args = append(args, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioSource)
+		}
 	} else {
 		args = append(args, "-re", "-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=1", w, h))
 	}
 
+	audioMapInput := "0"
+	if audioSource != "" {
+		audioMapInput = "1"
+	}
+
 	vBitrate := strings.TrimSpace(bitrate)
-		if vBitrate == "" {
-			vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
-		}
+	if vBitrate == "" {
+		vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
+	}
 	audioDelayMs := envIntOrDefault("AUDIO_DELAY_MS", 0)
 
 	if source != "" {
@@ -1003,7 +1019,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		aBitrate := envOrDefault("AUDIO_BITRATE", "128k")
 
 		args = append(args,
-			"-map", "0:a:0?",
+			"-map", fmt.Sprintf("%s:a:0?", audioMapInput),
 		)
 
 		if audioDelayMs > 0 {
@@ -1181,18 +1197,19 @@ func main() {
 
 	mux.HandleFunc("POST /source", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Source    string `json:"source"`
-			Width     int    `json:"width"`
-			Height    int    `json:"height"`
-			Framerate int    `json:"framerate"`
-			Bitrate   string `json:"bitrate"` 
+			Source      string `json:"source"`
+			Width       int    `json:"width"`
+			Height      int    `json:"height"`
+			Framerate   int    `json:"framerate"`
+			Bitrate     string `json:"bitrate"`
+			AudioSource string `json:"audioSource"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
 		log.Printf("[API] Setting source: %s (%dx%d @ %dfps, %s)", req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
-		sidecar.StartFFmpeg(req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
+		sidecar.StartFFmpeg(req.Source, req.Width, req.Height, req.Framerate, req.Bitrate, req.AudioSource)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 

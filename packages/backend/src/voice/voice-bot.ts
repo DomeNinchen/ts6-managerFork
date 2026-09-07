@@ -10,21 +10,34 @@ import { STREAM_PRESETS, DEFAULT_PRESET, type VideoViewerInfo, type VideoStreamS
 import { getCookieArgs } from './audio/youtube.js';
 import { spawn } from 'child_process';
 
-/** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
-function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> {
+export interface ResolvedVideoSource {
+  videoUrl: string;
+  /** Set when video/audio come from separate DASH streams that need muxing. */
+  audioUrl?: string;
+}
+
+/** Resolve a YouTube/yt-dlp-compatible URL to direct stream URL(s) */
+function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<ResolvedVideoSource> {
   // Only resolve YouTube and other yt-dlp-supported sites
   if (!url.includes('youtube.com/') && !url.includes('youtu.be/') && !url.includes('twitch.tv/')) {
-    return Promise.resolve(url);
+    return Promise.resolve({ videoUrl: url });
   }
 
   return new Promise((resolve, reject) => {
-    // Request best combined format (video+audio) up to the target height
-    const formatFilter = `best[height<=${maxHeight}][ext=mp4]/best[height<=${maxHeight}]/best[ext=mp4]/best`;
+    // YouTube only serves combined (single-stream) formats up to ~360p;
+    // 720p/1080p exist as separate video-only + audio-only DASH streams.
+    // Prefer bestvideo+bestaudio so we actually get the requested quality
+    // instead of silently falling back to an old low-res combined format
+    // (which we'd then have to upscale for no real benefit). The plain
+    // "best" alternatives remain as a fallback for sources where yt-dlp
+    // can't mux (e.g. no ffmpeg needed for muxing here since we hand both
+    // URLs to our own ffmpeg instead of letting yt-dlp merge them).
+    const formatFilter = `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best`;
     const proc = spawn('yt-dlp', [
       ...getCookieArgs(),
       '-f', formatFilter,
       '--no-playlist',
-      '-g',  // print direct URL only
+      '-g',  // print direct URL(s) only -- one per line for video+audio, two for a merged spec
       url,
     ], { shell: false });
 
@@ -37,13 +50,17 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> 
       if (code !== 0) {
         return reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(0, 200)}`));
       }
-      // yt-dlp -g returns the direct URL(s), take the first one
-      const directUrl = stdout.trim().split('\n')[0];
-      if (!directUrl) {
+      const urls = stdout.trim().split('\n').map((l) => l.trim()).filter(Boolean);
+      if (urls.length === 0) {
         return reject(new Error('yt-dlp returned no URL'));
       }
-      console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → direct URL`);
-      resolve(directUrl);
+      if (urls.length >= 2) {
+        console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → separate video+audio DASH streams`);
+        resolve({ videoUrl: urls[0], audioUrl: urls[1] });
+      } else {
+        console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → direct URL`);
+        resolve({ videoUrl: urls[0] });
+      }
     });
 
     proc.on('error', (err) => {
@@ -860,13 +877,14 @@ export class VoiceBot extends EventEmitter {
     this._videoStartedAt = Date.now();
 
     // Resolve YouTube/streaming URLs via yt-dlp, then start ffmpeg
-    const resolvedSource = await resolveVideoUrl(source, presetConfig.height);
+    const resolved = await resolveVideoUrl(source, presetConfig.height);
     await this.sidecarHttp.setSource(
-      resolvedSource,
+      resolved.videoUrl,
       presetConfig.width,
       presetConfig.height,
       effectiveFramerate,
       effectiveBitrate,
+      resolved.audioUrl,
     );
 
     console.log(`[VoiceBot ${this.config.id}] Video stream started: ${stream.id}, source: ${source}`);
@@ -925,14 +943,15 @@ export class VoiceBot extends EventEmitter {
     }
     this._videoSource = source;
     const currentPreset = STREAM_PRESETS[this._videoPreset] || STREAM_PRESETS[DEFAULT_PRESET];
-    const resolvedSource = await resolveVideoUrl(source, currentPreset.height);
+    const resolved = await resolveVideoUrl(source, currentPreset.height);
 
     await this.sidecarHttp.setSource(
-      resolvedSource,
+      resolved.videoUrl,
       currentPreset.width,
       currentPreset.height,
       this._videoFramerate,
       this._videoBitrate,
+      resolved.audioUrl,
     );
     console.log(`[VoiceBot ${this.config.id}] Video source changed: ${source}`);
     this.emit('videoSourceChanged', source);
