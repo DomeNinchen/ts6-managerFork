@@ -58,6 +58,22 @@ func envIntOrDefault(key string, def int) int {
 	return def
 }
 
+// clampToPowerOfTwo rounds n down to the nearest power of two within [min, max].
+// libvpx's VP8 token partitions (-slices) only accept 1/2/4/8.
+func clampToPowerOfTwo(n, min, max int) int {
+	if n < min {
+		return min
+	}
+	if n > max {
+		return max
+	}
+	p := min
+	for p*2 <= n {
+		p *= 2
+	}
+	return p
+}
+
 func getFfmpegPath() string {
 	return envOrDefault("FFMPEG_PATH", "ffmpeg")
 }
@@ -996,11 +1012,19 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 			"-vf", vf,
 		)
 	}
+	// libvpx's realtime VP8 encoder only parallelizes across CPU cores when
+	// given multiple token partitions (-slices) to match -threads; without
+	// both set it runs single-threaded regardless of cpu-used, which caps
+	// throughput well below what a real 1080p60fps source needs. Slices
+	// must be a power of two (1/2/4/8) -- see VIDEO_ENCODE_THREADS.
+	encodeThreads := clampToPowerOfTwo(envIntOrDefault("VIDEO_ENCODE_THREADS", 4), 1, 8)
 	args = append(args,
 		"-pix_fmt", "yuv420p",
 		"-c:v", "libvpx",
 		"-cpu-used", "8",
 		"-deadline", "realtime",
+		"-slices", strconv.Itoa(encodeThreads),
+		"-threads", strconv.Itoa(encodeThreads),
 		"-lag-in-frames", "0",
 		"-error-resilient", "1",
 		"-b:v", vBitrate,
