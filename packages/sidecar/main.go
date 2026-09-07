@@ -964,8 +964,15 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	audioDelayMs := envIntOrDefault("AUDIO_DELAY_MS", 0)
 
 	if source != "" {
+		// Cap the scale target at the source's own resolution (min(iw,w) x
+		// min(ih,h)) instead of always scaling up to the preset -- a source
+		// that's actually 640x360 encoded at a "1080p"/1280x720 preset was
+		// burning CPU upscaling and encoding pixels with no real detail in
+		// them, which is exactly the kind of load that tips libvpx's
+		// (largely single-threaded) realtime encoder over budget once a
+		// second viewer adds a bit more work on top.
 		vf := fmt.Sprintf(
-			"fps=%d,scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+			"fps=%d,scale='min(iw,%d)':'min(ih,%d)':force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
 			fps, w, h, w, h,
 		)
 		args = append(args,
@@ -976,7 +983,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	args = append(args,
 		"-pix_fmt", "yuv420p",
 		"-c:v", "libvpx",
-		"-cpu-used", "6",
+		"-cpu-used", "8",
 		"-deadline", "realtime",
 		"-lag-in-frames", "0",
 		"-error-resilient", "1",
