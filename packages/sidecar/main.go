@@ -392,9 +392,11 @@ func (s *Sidecar) readVideoRTP() {
 	buf := make([]byte, 1500)
 	pkt := &rtp.Packet{}
 	count := 0
+	var lastReadWall time.Time
 
 	for s.running {
 		n, err := s.videoConn.Read(buf)
+		readWall := time.Now()
 		if err != nil {
 			if s.running {
 				log.Printf("[RTP] Video read error: %v", err)
@@ -405,6 +407,19 @@ func (s *Sidecar) readVideoRTP() {
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
+
+		// Diagnostic: a gap here means ffmpeg itself went quiet on the
+		// video RTP output for a while (source read stall, encoder
+		// hiccup, CPU contention from e.g. a peer joining, etc) -- as
+		// opposed to a gap only appearing further downstream (queueing,
+		// WebRTC send, network), which would point at the sidecar or
+		// the network instead of ffmpeg.
+		if !lastReadWall.IsZero() {
+			if gap := readWall.Sub(lastReadWall); gap > 150*time.Millisecond {
+				log.Printf("[VIDEO] gap of %v between ffmpeg RTP reads (ts=%d)", gap, pkt.Timestamp)
+			}
+		}
+		lastReadWall = readWall
 
 		// Track RTP stats used by optional debug / legacy reporting paths
 		atomic.StoreUint64(&s.lastVideoRTPTs, uint64(pkt.Timestamp))
@@ -435,9 +450,11 @@ func (s *Sidecar) readAudioRTP() {
 	buf := make([]byte, 1500)
 	pkt := &rtp.Packet{}
 	count := 0
+	var lastReadWall time.Time
 
 	for s.running {
 		n, err := s.audioConn.Read(buf)
+		readWall := time.Now()
 		if err != nil {
 			if s.running {
 				log.Printf("[RTP] Audio read error: %v", err)
@@ -448,6 +465,18 @@ func (s *Sidecar) readAudioRTP() {
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
+
+		// Diagnostic: a gap here means ffmpeg itself went quiet on the
+		// audio RTP output for a while (source read stall, encoder
+		// hiccup, etc) -- as opposed to a gap only appearing further
+		// downstream (queueing, WebRTC send, network), which would
+		// point at the sidecar or the network instead of ffmpeg/source.
+		if !lastReadWall.IsZero() {
+			if gap := readWall.Sub(lastReadWall); gap > 150*time.Millisecond {
+				log.Printf("[AUDIO] gap of %v between ffmpeg RTP reads (ts=%d)", gap, pkt.Timestamp)
+			}
+		}
+		lastReadWall = readWall
 
 		// Track latest timestamp for RTCP Sender Reports
 		atomic.StoreUint64(&s.lastAudioRTPTs, uint64(pkt.Timestamp))
