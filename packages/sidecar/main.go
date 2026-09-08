@@ -254,9 +254,20 @@ func (s *Sidecar) computeTrackDelay(kind string, ts uint32, now time.Time) time.
 
 	current.latency = smoothDuration(current.latency, observedLatency)
 
+	// Chase the other track's latency to keep A/V in sync -- but only up to
+	// a cap. Without one, a track that's genuinely struggling (e.g. video
+	// backed up behind a queue-full/congestion ceiling, confirmed via
+	// climbing RTCP packetsLost) drags the OTHER, healthy track's pacing
+	// down with it: audio would get delayed by however far behind video
+	// has fallen, turning a video-only capacity problem into an audible
+	// audio stutter too. Past this cap we accept A/V drift instead.
 	targetLatency := current.latency
 	if other.initialized {
-		targetLatency = maxDuration(targetLatency, other.latency)
+		otherLatency := other.latency
+		if otherLatency > s.maxCrossTrackDelay {
+			otherLatency = s.maxCrossTrackDelay
+		}
+		targetLatency = maxDuration(targetLatency, otherLatency)
 	}
 
 	targetWall := expectedWall.Add(targetLatency).Add(s.syncBuffer)
@@ -395,23 +406,25 @@ type Sidecar struct {
 	audioQueue chan *rtp.Packet
 
 	// Stream pacing / A/V alignment state
-	timingMu       sync.Mutex
-	streamBaseWall time.Time
-	streamBaseSet  bool
-	videoTiming    TrackTiming
-	audioTiming    TrackTiming
-	syncBuffer     time.Duration
-	videoBias      time.Duration
+	timingMu           sync.Mutex
+	streamBaseWall     time.Time
+	streamBaseSet      bool
+	videoTiming        TrackTiming
+	audioTiming        TrackTiming
+	syncBuffer         time.Duration
+	videoBias          time.Duration
+	maxCrossTrackDelay time.Duration
 }
 
 func NewSidecar() *Sidecar {
 	return &Sidecar{
-		peers:      make(map[string]*Peer),
-		creating:   make(map[string]*createInFlight),
-		syncBuffer: time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
-		videoBias:  time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
-		videoQueue: make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
-		audioQueue: make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
+		peers:              make(map[string]*Peer),
+		creating:           make(map[string]*createInFlight),
+		syncBuffer:         time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
+		videoBias:          time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
+		maxCrossTrackDelay: time.Duration(envIntOrDefault("SYNC_MAX_CROSS_TRACK_MS", 150)) * time.Millisecond,
+		videoQueue:         make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
+		audioQueue:         make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
 	}
 }
 
