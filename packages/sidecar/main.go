@@ -254,20 +254,18 @@ func (s *Sidecar) computeTrackDelay(kind string, ts uint32, now time.Time) time.
 
 	current.latency = smoothDuration(current.latency, observedLatency)
 
-	// Chase the other track's latency to keep A/V in sync -- but only up to
-	// a cap. Without one, a track that's genuinely struggling (e.g. video
-	// backed up behind a queue-full/congestion ceiling, confirmed via
-	// climbing RTCP packetsLost) drags the OTHER, healthy track's pacing
-	// down with it: audio would get delayed by however far behind video
-	// has fallen, turning a video-only capacity problem into an audible
-	// audio stutter too. Past this cap we accept A/V drift instead.
+	// Only video chases audio's latency to keep lip-sync, never the other
+	// way around: a real deployment showed video's latency climbing during
+	// its known congestion ceiling (queue-full drops, climbing RTCP
+	// packetsLost) even with a 150ms cap on how much it could pull audio
+	// down -- video revisits that ceiling every few seconds under load, so
+	// audio kept hitting the cap over and over, which was still audible as
+	// stutter. Audio has effectively zero tolerance for that; video, being
+	// already visibly degraded under congestion, has much more. So audio is
+	// paced only by its own latency here, immune to whatever video is doing.
 	targetLatency := current.latency
-	if other.initialized {
-		otherLatency := other.latency
-		if otherLatency > s.maxCrossTrackDelay {
-			otherLatency = s.maxCrossTrackDelay
-		}
-		targetLatency = maxDuration(targetLatency, otherLatency)
+	if kind == "video" && other.initialized {
+		targetLatency = maxDuration(targetLatency, other.latency)
 	}
 
 	targetWall := expectedWall.Add(targetLatency).Add(s.syncBuffer)
@@ -406,25 +404,23 @@ type Sidecar struct {
 	audioQueue chan *rtp.Packet
 
 	// Stream pacing / A/V alignment state
-	timingMu           sync.Mutex
-	streamBaseWall     time.Time
-	streamBaseSet      bool
-	videoTiming        TrackTiming
-	audioTiming        TrackTiming
-	syncBuffer         time.Duration
-	videoBias          time.Duration
-	maxCrossTrackDelay time.Duration
+	timingMu       sync.Mutex
+	streamBaseWall time.Time
+	streamBaseSet  bool
+	videoTiming    TrackTiming
+	audioTiming    TrackTiming
+	syncBuffer     time.Duration
+	videoBias      time.Duration
 }
 
 func NewSidecar() *Sidecar {
 	return &Sidecar{
-		peers:              make(map[string]*Peer),
-		creating:           make(map[string]*createInFlight),
-		syncBuffer:         time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
-		videoBias:          time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
-		maxCrossTrackDelay: time.Duration(envIntOrDefault("SYNC_MAX_CROSS_TRACK_MS", 150)) * time.Millisecond,
-		videoQueue:         make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
-		audioQueue:         make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
+		peers:      make(map[string]*Peer),
+		creating:   make(map[string]*createInFlight),
+		syncBuffer: time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
+		videoBias:  time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
+		videoQueue: make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
+		audioQueue: make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
 	}
 }
 
