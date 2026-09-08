@@ -12,11 +12,9 @@ import { spawn } from 'child_process';
 
 export interface ResolvedVideoSource {
   videoUrl: string;
-  /** Set when video/audio come from separate DASH streams that need muxing. */
-  audioUrl?: string;
 }
 
-/** Resolve a YouTube/yt-dlp-compatible URL to direct stream URL(s) */
+/** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
 function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<ResolvedVideoSource> {
   // Only resolve YouTube and other yt-dlp-supported sites
   if (!url.includes('youtube.com/') && !url.includes('youtu.be/') && !url.includes('twitch.tv/')) {
@@ -24,26 +22,25 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<Resolved
   }
 
   return new Promise((resolve, reject) => {
-    // YouTube only serves combined (single-stream) formats up to ~360p;
-    // 720p/1080p exist as separate video-only + audio-only DASH streams.
-    // Prefer bestvideo+bestaudio so we actually get the requested quality
-    // instead of silently falling back to an old low-res combined format
-    // (which we'd then have to upscale for no real benefit). The plain
-    // "best" alternatives remain as a fallback for sources where yt-dlp
-    // can't mux (e.g. no ffmpeg needed for muxing here since we hand both
-    // URLs to our own ffmpeg instead of letting yt-dlp merge them).
+    // Request a single combined (pre-muxed) format instead of separately
+    // resolving bestvideo+bestaudio DASH streams and muxing them ourselves:
+    // at 1080p/30fps/4500k that combined pipeline is stable, whereas pushing
+    // separate video-only + audio-only DASH tracks (needed for e.g. genuine
+    // 1080p60fps) exposed a cascade of CDN-burst-throttling and A/V-sync
+    // issues neither the original ts6-manager nor its other forks (which all
+    // use this same combined-format approach) ever had to deal with.
     //
-    // Excluding m3u8 (HLS) protocols is deliberate: YouTube's HLS variants
-    // segment across multiple CDN edge hosts, and each host switch forces
-    // ffmpeg to tear down and re-establish its HTTP connection (DNS+TCP+TLS)
-    // mid-stream -- that shows up as a real ~150-900ms stall, independent of
-    // any local buffering. The DASH/https formats stay on one host.
-    const formatFilter = `bestvideo[height<=${maxHeight}][protocol!*=m3u8]+bestaudio[protocol!*=m3u8]/best[height<=${maxHeight}]/best`;
+    // Excluding m3u8 (HLS) protocols is still deliberate: YouTube's HLS
+    // variants segment across multiple CDN edge hosts, and each host switch
+    // forces ffmpeg to tear down and re-establish its HTTP connection
+    // (DNS+TCP+TLS) mid-stream -- a real ~150-900ms stall, independent of
+    // any local buffering.
+    const formatFilter = `best[height<=${maxHeight}][protocol!*=m3u8]/best[height<=${maxHeight}]/best`;
     const proc = spawn('yt-dlp', [
       ...getCookieArgs(),
       '-f', formatFilter,
       '--no-playlist',
-      '-g',  // print direct URL(s) only -- one per line for video+audio, two for a merged spec
+      '-g',  // print the direct URL only
       url,
     ], { shell: false });
 
@@ -60,13 +57,8 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<Resolved
       if (urls.length === 0) {
         return reject(new Error('yt-dlp returned no URL'));
       }
-      if (urls.length >= 2) {
-        console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → separate video+audio DASH streams`);
-        resolve({ videoUrl: urls[0], audioUrl: urls[1] });
-      } else {
-        console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → direct URL`);
-        resolve({ videoUrl: urls[0] });
-      }
+      console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → direct URL`);
+      resolve({ videoUrl: urls[0] });
     });
 
     proc.on('error', (err) => {
@@ -890,7 +882,6 @@ export class VoiceBot extends EventEmitter {
       presetConfig.height,
       effectiveFramerate,
       effectiveBitrate,
-      resolved.audioUrl,
     );
 
     console.log(`[VoiceBot ${this.config.id}] Video stream started: ${stream.id}, source: ${source}`);
@@ -957,7 +948,6 @@ export class VoiceBot extends EventEmitter {
       currentPreset.height,
       this._videoFramerate,
       this._videoBitrate,
-      resolved.audioUrl,
     );
     console.log(`[VoiceBot ${this.config.id}] Video source changed: ${source}`);
     this.emit('videoSourceChanged', source);
