@@ -3,14 +3,11 @@ FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY packages/sidecar/go.mod packages/sidecar/go.sum ./
 RUN go mod download
-COPY packages/sidecar/main.go .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /sidecar main.go
+COPY packages/sidecar/main.go packages/sidecar/prefetch_linux.go packages/sidecar/prefetch_other.go .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /sidecar .
 
-# Bookworm's apt-installable ffmpeg is 5.1, which lacks -readrate_initial_burst
-# (added in 6.1). That flag lets ffmpeg fetch a few seconds of a network
-# source at full speed before switching to real-time-paced reads, so brief
-# CDN read stalls get absorbed by the buffer instead of stalling the encoder.
-# Pull a static, self-contained ffmpeg binary instead of apt's older one.
+# A modern static, self-contained ffmpeg build instead of bookworm's apt
+# package (5.1), which is missing several codec/demuxer fixes present here.
 FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
 
 FROM debian:bookworm-slim

@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -326,6 +329,7 @@ type Sidecar struct {
 	ffmpegLock sync.Mutex
 	source     string
 	running    bool
+	prefetches []*prefetchStream
 
 	// Atomic timestamps for RTCP Sender Report generation
 	lastVideoRTPTs uint64 // atomic: latest video RTP timestamp seen
@@ -961,6 +965,110 @@ func (s *Sidecar) ClosePeer(id string) {
 	s.peersLock.Unlock()
 }
 
+// Linux's default pipe buffer is 64KB. Direct measurement (both from this
+// container's own network path and from an unrelated residential
+// connection) showed some YouTube CDN edge servers deliver certain DASH
+// formats in ~16KB bursts every ~450-550ms rather than smoothly -- a
+// server-side throttling behavior on Google's end, not a local issue.
+// 64KB drains in well under one burst interval, so ffmpeg's real-time-paced
+// reads stall right along with the CDN's gaps no matter how large
+// thread_queue_size is set (that only buffers packets ffmpeg has already
+// read from the pipe/socket, not bytes the OS hasn't received yet). A 1MB
+// pipe buffer gives roughly a minute of slack for typical audio bitrates
+// and several seconds for video, comfortably absorbing the observed gaps.
+const prefetchPipeSize = 1 << 20
+
+type prefetchStream struct {
+	path   string
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// startPrefetch fetches sourceURL into a named pipe using our own
+// unthrottled Go HTTP client, decoupling ffmpeg's real-time-paced reads
+// from the network entirely: ffmpeg reads the pipe with -re exactly as it
+// would a local file, and the CDN's periodic delivery gaps just eat into
+// the pipe's buffer instead of stalling the encoder.
+func startPrefetch(sourceURL string) (*prefetchStream, error) {
+	fifoPath := filepath.Join(os.TempDir(), fmt.Sprintf("sidecar-prefetch-%d-%d.fifo", os.Getpid(), time.Now().UnixNano()))
+	if err := mkfifo(fifoPath); err != nil {
+		return nil, fmt.Errorf("mkfifo: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		defer os.Remove(fifoPath)
+
+		// Blocks until ffmpeg opens the other end for reading, which
+		// happens moments later since ffmpeg is started right after this
+		// call returns.
+		w, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("[Prefetch] Failed to open fifo for writing: %v", err)
+			}
+			return
+		}
+		defer w.Close()
+
+		growPipeBuffer(w, prefetchPipeSize)
+
+		fetchWithResume(ctx, sourceURL, w)
+	}()
+
+	return &prefetchStream{path: fifoPath, cancel: cancel, done: done}, nil
+}
+
+// fetchWithResume streams sourceURL into w, resuming with a byte-range
+// request if the connection drops partway through. This replaces the
+// resilience ffmpeg's own -reconnect flags provided back when it read the
+// network directly, now that it only ever sees the local pipe.
+func fetchWithResume(ctx context.Context, sourceURL string, w io.Writer) {
+	var written int64
+	for attempt := 0; attempt < 5; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+		if err != nil {
+			log.Printf("[Prefetch] Request build failed: %v", err)
+			return
+		}
+		if written > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", written))
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("[Prefetch] Fetch attempt %d failed: %v", attempt+1, err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		n, copyErr := io.Copy(w, resp.Body)
+		resp.Body.Close()
+		written += n
+
+		if copyErr == nil {
+			return // EOF reached cleanly -- whole source delivered
+		}
+		if ctx.Err() != nil {
+			return // asked to stop, not a real failure
+		}
+		log.Printf("[Prefetch] Copy interrupted after %d bytes (attempt %d): %v", written, attempt+1, copyErr)
+		time.Sleep(time.Second)
+	}
+	log.Printf("[Prefetch] Giving up after repeated failures, %d bytes delivered", written)
+}
+
+func (p *prefetchStream) Stop() {
+	p.cancel()
+	<-p.done
+}
+
 func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate int, bitrate string, audioSource string) {
 	s.ffmpegLock.Lock()
 	defer s.ffmpegLock.Unlock()
@@ -1000,24 +1108,23 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	// stall. Bumping it gives ffmpeg's network reader thread real slack.
 	threadQueueSize := strconv.Itoa(envIntOrDefault("THREAD_QUEUE_SIZE", 4096))
 
-	// -re paces reads to match wall-clock, which is necessary so ffmpeg
-	// doesn't devour the whole source immediately -- but it also means
-	// there's never any slack: a brief stall fetching the next chunk from
-	// the CDN stalls the encoder right along with it, even with a large
-	// thread_queue_size (that only buffers packets ffmpeg has already
-	// managed to read). -readrate_initial_burst lets ffmpeg read the first
-	// few seconds as fast as the network allows *before* -re pacing kicks
-	// in, building a real time-based buffer that absorbs later hiccups.
-	readrateBurst := strconv.Itoa(envIntOrDefault("READRATE_INITIAL_BURST", 10))
+	videoInput := source
+	audioInput := audioSource
 
 	if source != "" {
 		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-readrate_initial_burst", readrateBurst)
+			if pf, err := startPrefetch(source); err != nil {
+				log.Printf("[FFmpeg] Video prefetch setup failed, reading network directly: %v", err)
+				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+			} else {
+				s.prefetches = append(s.prefetches, pf)
+				videoInput = pf.path
+			}
 		} else {
 			args = append(args, "-stream_loop", "-1")
 		}
 
-		args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", source)
+		args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", videoInput)
 
 		// Video-only and audio-only DASH streams resolved separately (e.g.
 		// YouTube only serves combined formats up to ~360p; better quality
@@ -1025,9 +1132,15 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		// than upscaling the low-res combined format.
 		if audioSource != "" {
 			if strings.HasPrefix(audioSource, "http://") || strings.HasPrefix(audioSource, "https://") {
-				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-readrate_initial_burst", readrateBurst)
+				if pf, err := startPrefetch(audioSource); err != nil {
+					log.Printf("[FFmpeg] Audio prefetch setup failed, reading network directly: %v", err)
+					args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+				} else {
+					s.prefetches = append(s.prefetches, pf)
+					audioInput = pf.path
+				}
 			}
-			args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioSource)
+			args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioInput)
 		}
 	} else {
 		args = append(args, "-re", "-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:r=1", w, h))
@@ -1136,6 +1249,13 @@ func (s *Sidecar) StopFFmpegLocked() {
 		s.ffmpeg.Process.Kill()
 		s.ffmpeg = nil
 	}
+	// Kill ffmpeg before stopping the prefetchers: closing its fd on the
+	// pipe is what unblocks a prefetcher goroutine that's mid-write (a
+	// cancelled context alone doesn't interrupt a blocking pipe write).
+	for _, pf := range s.prefetches {
+		pf.Stop()
+	}
+	s.prefetches = nil
 }
 
 func (s *Sidecar) GetStats() map[string]interface{} {
