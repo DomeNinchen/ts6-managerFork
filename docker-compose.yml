@@ -39,6 +39,13 @@ services:
       dockerfile: Dockerfile.sidecar
     container_name: ts6-sidecar
     restart: unless-stopped
+    # Needed to raise the prefetch pipe's kernel buffer past the 64KB
+    # default (F_SETPIPE_SZ) -- without it, Docker's default capability set
+    # returns EPERM and the CDN-burst buffering fix silently runs at 64KB,
+    # which isn't enough slack to absorb the observed ~500ms bursts at
+    # typical video bitrates.
+    cap_add:
+      - SYS_RESOURCE
     environment:
       - SIDECAR_PORT=9800
     ports:
