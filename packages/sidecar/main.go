@@ -313,6 +313,58 @@ type Peer struct {
 	// set can't be applied yet (pion rejects them with "remote description
 	// is not set"); buffer them here and flush once SetAnswer succeeds.
 	pendingCandidates []webrtc.ICECandidateInit
+
+	// Real packet loss/jitter as reported back by this peer over RTCP
+	// Receiver Reports -- guarded by mu, filled in by readSenderRTCP. pion
+	// v4.0.5's own GetStats() doesn't collect these for RTP senders, so we
+	// read the RTCP feedback channel directly instead.
+	videoPacketsLost uint32
+	videoJitter      float64 // seconds
+	audioPacketsLost uint32
+	audioJitter      float64 // seconds
+}
+
+// RTP clock rates for the tracks created in CreatePeer -- needed to convert
+// RTCP jitter (reported in RTP timestamp units, RFC 3550 6.4.1) to seconds.
+const (
+	videoClockRate = 90000
+	audioClockRate = 48000
+)
+
+// readSenderRTCP reads RTCP Receiver Reports sent back by the peer for the
+// track this sender is sending, and records the latest packet-loss/jitter
+// figures on peer. This is real feedback from the actual network path to
+// that peer (e.g. a TS6 client's connection), not anything visible from
+// ffmpeg's own output -- see the RTP-read-gap diagnostic for that side.
+func readSenderRTCP(peer *Peer, sender *webrtc.RTPSender, kind string) {
+	clockRate := float64(videoClockRate)
+	if kind == "audio" {
+		clockRate = audioClockRate
+	}
+
+	for {
+		packets, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		for _, pkt := range packets {
+			rr, ok := pkt.(*rtcp.ReceiverReport)
+			if !ok || len(rr.Reports) == 0 {
+				continue
+			}
+			report := rr.Reports[0]
+			jitterSeconds := float64(report.Jitter) / clockRate
+			peer.mu.Lock()
+			if kind == "video" {
+				peer.videoPacketsLost = report.TotalLost
+				peer.videoJitter = jitterSeconds
+			} else {
+				peer.audioPacketsLost = report.TotalLost
+				peer.audioJitter = jitterSeconds
+			}
+			peer.mu.Unlock()
+		}
+	}
 }
 
 type Sidecar struct {
@@ -724,11 +776,13 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		return "", err
 	}
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	videoSender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		pc.Close()
 		return "", err
 	}
-	if _, err = pc.AddTrack(audioTrack); err != nil {
+	audioSender, err := pc.AddTrack(audioTrack)
+	if err != nil {
 		pc.Close()
 		return "", err
 	}
@@ -741,6 +795,9 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		Active:     false,
 		stopSR:     make(chan struct{}),
 	}
+
+	go readSenderRTCP(peer, videoSender, "video")
+	go readSenderRTCP(peer, audioSender, "audio")
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[Peer %s] ICE: %s", id, state.String())
@@ -1264,21 +1321,22 @@ func (s *Sidecar) GetStats() map[string]interface{} {
 
 	peers := map[string]interface{}{}
 	for id, peer := range s.peers {
-		// remote-inbound-rtp reflects RTCP Receiver Reports sent back by the
-		// peer itself -- this is real packet loss/jitter as observed on the
-		// actual network path to that peer (the TS6 client's TeamSpeak
-		// connection, not our container's loopback), which none of the
-		// ffmpeg-side RTP-read diagnostics can see.
-		remote := map[string]interface{}{}
-		for _, stat := range peer.PC.GetStats() {
-			if rr, ok := stat.(webrtc.RemoteInboundRTPStreamStats); ok {
-				remote[rr.Kind] = map[string]interface{}{
-					"packetsLost":   rr.PacketsLost,
-					"jitter":        rr.Jitter,
-					"roundTripTime": rr.RoundTripTime,
-				}
-			}
+		// Real packet loss/jitter as reported back by this peer over RTCP
+		// Receiver Reports (collected by readSenderRTCP) -- this is the
+		// actual network path to that peer (e.g. a TS6 client's connection),
+		// which none of the ffmpeg-side RTP-read diagnostics can see.
+		peer.mu.Lock()
+		remote := map[string]interface{}{
+			"video": map[string]interface{}{
+				"packetsLost": peer.videoPacketsLost,
+				"jitter":      peer.videoJitter,
+			},
+			"audio": map[string]interface{}{
+				"packetsLost": peer.audioPacketsLost,
+				"jitter":      peer.audioJitter,
+			},
 		}
+		peer.mu.Unlock()
 
 		peers[id] = map[string]interface{}{
 			"active":           peer.Active,
