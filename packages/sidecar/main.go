@@ -318,6 +318,20 @@ type Peer struct {
 	Started         bool
 	mu              sync.Mutex
 	stopSR          chan struct{}
+
+	// Per-peer outbound queues, drained by this peer's own writer goroutine
+	// (see peerWriteLoop). Forwarding used to call WriteRTP for every peer
+	// synchronously (via a shared sync.WaitGroup) from within the single
+	// shared processVideoRTP/processAudioRTP loop, so ONE peer with a slow
+	// WriteRTP -- e.g. a real client over a congested/lossy internet path,
+	// where SRTP-write latency can spike well above a real client on a local
+	// Docker bridge -- stalled delivery to every other peer too, and stalled
+	// the shared pacing clock computing the next packet's delay. Giving each
+	// peer its own buffered channel and writer goroutine means a slow peer
+	// only ever backs up (and drops from) its own queue. Never closed (see
+	// peerWriteLoop) -- its writer goroutine exits via stopSR instead.
+	videoOut chan *rtp.Packet
+	audioOut chan *rtp.Packet
 	// Trickle ICE candidates that arrive before the remote description is
 	// set can't be applied yet (pion rejects them with "remote description
 	// is not set"); buffer them here and flush once SetAnswer succeeds.
@@ -372,6 +386,27 @@ func readSenderRTCP(peer *Peer, sender *webrtc.RTPSender, kind string) {
 				peer.audioJitter = jitterSeconds
 			}
 			peer.mu.Unlock()
+		}
+	}
+}
+
+// peerWriteLoop serializes RTP writes to one peer's track, fed by that
+// peer's own buffered channel. Running one of these per peer per track is
+// what lets a single congested/slow peer fall behind (and drop packets from
+// its own queue) without affecting any other peer or the shared pacing loop
+// that feeds these channels -- see the comment on Peer.videoOut/audioOut.
+// Stops on stopSR (the same peer-teardown signal used elsewhere) rather than
+// on the channel being closed -- processVideoRTP/processAudioRTP send into
+// ch without holding any lock, so closing it here could race a send from
+// there and panic; stopSR is only ever closed once, under s.peersLock, by
+// whichever teardown path removes this peer.
+func peerWriteLoop(ch chan *rtp.Packet, track *webrtc.TrackLocalStaticRTP, stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case pkt := <-ch:
+			_ = track.WriteRTP(pkt)
 		}
 	}
 }
@@ -571,6 +606,7 @@ func (s *Sidecar) readAudioRTP() {
 func (s *Sidecar) processVideoRTP() {
 	var lastTS uint32
 	haveTS := false
+	dropCount := 0
 
 	for pkt := range s.videoQueue {
 		if !haveTS || pkt.Timestamp != lastTS {
@@ -590,17 +626,14 @@ func (s *Sidecar) processVideoRTP() {
 		}
 		s.peersLock.RUnlock()
 
-		// Forward to all peers concurrently -- with N peers, writing to them
-		// one at a time (SRTP encrypt + syscall each) can add up to more than
-		// one frame interval, which backs up the queue and causes exactly the
-		// packet drops/stutter this is meant to avoid. Only the gate check
-		// (fast, in-memory) stays synchronous.
-		var wg sync.WaitGroup
+		// Hand off to each peer's own outbound queue instead of writing (and
+		// waiting on) all peers synchronously here -- see the comment on
+		// Peer.videoOut/audioOut for why. Only the gate check (fast,
+		// in-memory) stays inline.
 		for _, peer := range peers {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
-			track := peer.VideoTrack
 
 			if active && !started && isVP8KeyframeStart(pkt.Payload) {
 				peer.Started = true
@@ -610,21 +643,24 @@ func (s *Sidecar) processVideoRTP() {
 
 			peer.mu.Unlock()
 
-			if active && started && track != nil {
-				wg.Add(1)
-				go func(t *webrtc.TrackLocalStaticRTP) {
-					defer wg.Done()
-					_ = t.WriteRTP(pkt)
-				}(track)
+			if active && started {
+				select {
+				case peer.videoOut <- pkt:
+				default:
+					dropCount++
+					if dropCount%120 == 1 {
+						log.Printf("[VIDEO] peer %s outbound queue full, dropping packet ts=%d", peer.ID, pkt.Timestamp)
+					}
+				}
 			}
 		}
-		wg.Wait()
 	}
 }
 
 func (s *Sidecar) processAudioRTP() {
 	var lastTS uint32
 	haveTS := false
+	dropCount := 0
 
 	for pkt := range s.audioQueue {
 		if !haveTS || pkt.Timestamp != lastTS {
@@ -644,23 +680,23 @@ func (s *Sidecar) processAudioRTP() {
 		}
 		s.peersLock.RUnlock()
 
-		var wg sync.WaitGroup
 		for _, peer := range peers {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
-			track := peer.AudioTrack
 			peer.mu.Unlock()
 
-			if active && started && track != nil {
-				wg.Add(1)
-				go func(t *webrtc.TrackLocalStaticRTP) {
-					defer wg.Done()
-					_ = t.WriteRTP(pkt)
-				}(track)
+			if active && started {
+				select {
+				case peer.audioOut <- pkt:
+				default:
+					dropCount++
+					if dropCount%200 == 1 {
+						log.Printf("[AUDIO] peer %s outbound queue full, dropping packet ts=%d", peer.ID, pkt.Timestamp)
+					}
+				}
 			}
 		}
-		wg.Wait()
 	}
 }
 
@@ -803,10 +839,14 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		AudioTrack: audioTrack,
 		Active:     false,
 		stopSR:     make(chan struct{}),
+		videoOut:   make(chan *rtp.Packet, envIntOrDefault("PEER_VIDEO_QUEUE_SIZE", 256)),
+		audioOut:   make(chan *rtp.Packet, envIntOrDefault("PEER_AUDIO_QUEUE_SIZE", 512)),
 	}
 
 	go readSenderRTCP(peer, videoSender, "video")
 	go readSenderRTCP(peer, audioSender, "audio")
+	go peerWriteLoop(peer.videoOut, videoTrack, peer.stopSR)
+	go peerWriteLoop(peer.audioOut, audioTrack, peer.stopSR)
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[Peer %s] ICE: %s", id, state.String())
