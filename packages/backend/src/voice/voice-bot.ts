@@ -32,7 +32,13 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<Resolved
     // "best" alternatives remain as a fallback for sources where yt-dlp
     // can't mux (e.g. no ffmpeg needed for muxing here since we hand both
     // URLs to our own ffmpeg instead of letting yt-dlp merge them).
-    const formatFilter = `bestvideo[height<=${maxHeight}]+bestaudio/best[height<=${maxHeight}]/best`;
+    //
+    // Excluding m3u8 (HLS) protocols is deliberate: YouTube's HLS variants
+    // segment across multiple CDN edge hosts, and each host switch forces
+    // ffmpeg to tear down and re-establish its HTTP connection (DNS+TCP+TLS)
+    // mid-stream -- that shows up as a real ~150-900ms stall, independent of
+    // any local buffering. The DASH/https formats stay on one host.
+    const formatFilter = `bestvideo[height<=${maxHeight}][protocol!*=m3u8]+bestaudio[protocol!*=m3u8]/best[height<=${maxHeight}]/best`;
     const proc = spawn('yt-dlp', [
       ...getCookieArgs(),
       '-f', formatFilter,
