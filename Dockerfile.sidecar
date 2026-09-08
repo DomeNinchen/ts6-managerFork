@@ -6,10 +6,18 @@ RUN go mod download
 COPY packages/sidecar/main.go .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /sidecar main.go
 
+# Bookworm's apt-installable ffmpeg is 5.1, which lacks -readrate_initial_burst
+# (added in 6.1). That flag lets ffmpeg fetch a few seconds of a network
+# source at full speed before switching to real-time-paced reads, so brief
+# CDN read stalls get absorbed by the buffer instead of stalling the encoder.
+# Pull a static, self-contained ffmpeg binary instead of apt's older one.
+FROM mwader/static-ffmpeg:7.1.1 AS ffmpeg
+
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 COPY --from=build /sidecar /usr/local/bin/sidecar
 EXPOSE 9800
 CMD ["sidecar"]
