@@ -1000,9 +1000,19 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	// stall. Bumping it gives ffmpeg's network reader thread real slack.
 	threadQueueSize := strconv.Itoa(envIntOrDefault("THREAD_QUEUE_SIZE", 4096))
 
+	// -re paces reads to match wall-clock, which is necessary so ffmpeg
+	// doesn't devour the whole source immediately -- but it also means
+	// there's never any slack: a brief stall fetching the next chunk from
+	// the CDN stalls the encoder right along with it, even with a large
+	// thread_queue_size (that only buffers packets ffmpeg has already
+	// managed to read). -readrate_initial_burst lets ffmpeg read the first
+	// few seconds as fast as the network allows *before* -re pacing kicks
+	// in, building a real time-based buffer that absorbs later hiccups.
+	readrateBurst := strconv.Itoa(envIntOrDefault("READRATE_INITIAL_BURST", 10))
+
 	if source != "" {
 		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+			args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-readrate_initial_burst", readrateBurst)
 		} else {
 			args = append(args, "-stream_loop", "-1")
 		}
@@ -1015,7 +1025,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		// than upscaling the low-res combined format.
 		if audioSource != "" {
 			if strings.HasPrefix(audioSource, "http://") || strings.HasPrefix(audioSource, "https://") {
-				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-readrate_initial_burst", readrateBurst)
 			}
 			args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioSource)
 		}
