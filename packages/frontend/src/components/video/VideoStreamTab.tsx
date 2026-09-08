@@ -31,6 +31,22 @@ const FPS_OPTIONS = [
   { value: '60', label: '60 FPS' },
 ];
 
+// 60fps at 1080p means genuinely-separate video-only + audio-only DASH
+// tracks (YouTube doesn't offer a combined 1080p60 format), which is what
+// drove the CDN-throttling/A-V-sync issues fixed by reverting to a single
+// combined format (see PR #22) -- so it's disabled here rather than left as
+// a footgun. 720p/480p never triggered that, so they keep 60fps available.
+const FPS_DISABLED_AT_PRESET: Record<string, string[]> = {
+  '1080p': ['60'],
+};
+
+const BITRATE_OPTIONS = [
+  { value: '1500k', label: '1500k' },
+  { value: '2500k', label: '2500k' },
+  { value: '3500k', label: '3500k' },
+  { value: '4500k', label: '4500k' },
+];
+
 interface VideoStreamTabProps {
   botId: number;
   botStatus: string;
@@ -50,6 +66,15 @@ export function VideoStreamTab({ botId, botStatus }: VideoStreamTabProps) {
 
   const isStreaming = streamStatus?.streaming ?? false;
   const isBotConnected = botStatus === 'connected' || botStatus === 'playing' || botStatus === 'paused';
+
+  const disabledFpsValues = FPS_DISABLED_AT_PRESET[preset] ?? [];
+
+  const handlePresetChange = (value: string) => {
+    setPreset(value);
+    if ((FPS_DISABLED_AT_PRESET[value] ?? []).includes(framerate)) {
+      setFramerate('30');
+    }
+  };
 
   const handleStart = () => {
     if (!sourceUrl.trim()) return;
@@ -140,7 +165,7 @@ export function VideoStreamTab({ botId, botStatus }: VideoStreamTabProps) {
                           key={p.value}
                           variant={preset === p.value ? 'default' : 'outline'}
                           size="sm"
-                          onClick={() => setPreset(p.value)}
+                          onClick={() => handlePresetChange(p.value)}
                         >
                           {p.value}
                         </Button>
@@ -151,28 +176,37 @@ export function VideoStreamTab({ botId, botStatus }: VideoStreamTabProps) {
                   <div className="space-y-2">
                     <Label>Frame Rate (FPS)</Label>
                     <div className="flex gap-2">
-                      {FPS_OPTIONS.map((fps) => (
-                        <Button
-                          key={fps.value}
-                          variant={framerate === fps.value ? 'default' : 'outline'}
-                          size="sm"
-                          onClick={() => setFramerate(fps.value)}
-                        >
-                          {fps.label}
-                        </Button>
-                      ))}
+                      {FPS_OPTIONS.map((fps) => {
+                        const isDisabled = disabledFpsValues.includes(fps.value);
+                        return (
+                          <Button
+                            key={fps.value}
+                            variant={framerate === fps.value ? 'default' : 'outline'}
+                            size="sm"
+                            disabled={isDisabled}
+                            title={isDisabled ? `60 FPS needs separate video/audio tracks YouTube doesn't offer at ${preset} pre-muxed` : undefined}
+                            onClick={() => setFramerate(fps.value)}
+                          >
+                            {fps.label}
+                          </Button>
+                        );
+                      })}
                     </div>
                   </div>
                   <div className="space-y-2">
                     <Label>Video Bitrate</Label>
-                    <Input
-                      value={bitrate}
-                      onChange={(e) => setBitrate(e.target.value)}
-                      placeholder="e.g. 1500k, 2500k, 4500k"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Examples: 1500k, 2500k, 4500k, 6000k
-                    </p>
+                    <div className="flex gap-2">
+                      {BITRATE_OPTIONS.map((b) => (
+                        <Button
+                          key={b.value}
+                          variant={bitrate === b.value ? 'default' : 'outline'}
+                          size="sm"
+                          onClick={() => setBitrate(b.value)}
+                        >
+                          {b.label}
+                        </Button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

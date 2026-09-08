@@ -81,6 +81,26 @@ func getFfmpegPath() string {
 	return envOrDefault("FFMPEG_PATH", "ffmpeg")
 }
 
+// parseBitrateBps parses an ffmpeg-style bitrate string ("4500k", "128k",
+// "1200000") into bits per second. Returns 0 if it can't be parsed, so
+// callers should treat that as "unknown" rather than a real zero bitrate.
+func parseBitrateBps(s string) int {
+	s = strings.TrimSpace(strings.ToLower(s))
+	mult := 1
+	if strings.HasSuffix(s, "k") {
+		mult = 1000
+		s = strings.TrimSuffix(s, "k")
+	} else if strings.HasSuffix(s, "m") {
+		mult = 1000000
+		s = strings.TrimSuffix(s, "m")
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n * mult
+}
+
 func debugLogsEnabled() bool {
 	return os.Getenv("SIDECAR_DEBUG_LOGS") == "1"
 }
@@ -1079,10 +1099,12 @@ func (s *Sidecar) ClosePeer(id string) {
 // 64KB drains in well under one burst interval, so ffmpeg's real-time-paced
 // reads stall right along with the CDN's gaps no matter how large
 // thread_queue_size is set (that only buffers packets ffmpeg has already
-// read from the pipe/socket, not bytes the OS hasn't received yet). A 1MB
-// pipe buffer gives roughly a minute of slack for typical audio bitrates
-// and several seconds for video, comfortably absorbing the observed gaps.
-const prefetchPipeSize = 1 << 20
+// read from the pipe/socket, not bytes the OS hasn't received yet).
+//
+// minPrefetchPipeSize is the floor even when a caller asks for a smaller
+// buffer (e.g. an unparsed/zero bitrate) -- StartFFmpeg sizes the real
+// buffer to hold STREAM_STARTUP_BUFFER_SECONDS of the configured bitrate.
+const minPrefetchPipeSize = 1 << 20
 
 type prefetchStream struct {
 	path   string
@@ -1094,8 +1116,13 @@ type prefetchStream struct {
 // unthrottled Go HTTP client, decoupling ffmpeg's real-time-paced reads
 // from the network entirely: ffmpeg reads the pipe with -re exactly as it
 // would a local file, and the CDN's periodic delivery gaps just eat into
-// the pipe's buffer instead of stalling the encoder.
-func startPrefetch(sourceURL string) (*prefetchStream, error) {
+// the pipe's buffer instead of stalling the encoder. pipeSize is clamped up
+// to minPrefetchPipeSize.
+func startPrefetch(sourceURL string, pipeSize int) (*prefetchStream, error) {
+	if pipeSize < minPrefetchPipeSize {
+		pipeSize = minPrefetchPipeSize
+	}
+
 	fifoPath := filepath.Join(os.TempDir(), fmt.Sprintf("sidecar-prefetch-%d-%d.fifo", os.Getpid(), time.Now().UnixNano()))
 	if err := mkfifo(fifoPath); err != nil {
 		return nil, fmt.Errorf("mkfifo: %w", err)
@@ -1108,19 +1135,30 @@ func startPrefetch(sourceURL string) (*prefetchStream, error) {
 		defer close(done)
 		defer os.Remove(fifoPath)
 
-		// Blocks until ffmpeg opens the other end for reading, which
-		// happens moments later since ffmpeg is started right after this
-		// call returns.
-		w, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		// Opened O_RDWR rather than O_WRONLY: on Linux (see fifo(7)) that is
+		// the one open mode on a FIFO that never blocks waiting for a peer,
+		// which is exactly what we need here -- an O_WRONLY open blocks
+		// until ffmpeg opens its end for reading, meaning fetching couldn't
+		// even start until ffmpeg was already running, so this pipe could
+		// only ever smooth momentary jitter, never build a genuine
+		// head-start buffer before playback begins. With O_RDWR we can
+		// start pulling from the CDN and filling the (now much larger,
+		// bitrate-and-STREAM_STARTUP_BUFFER_SECONDS-sized) pipe buffer
+		// immediately, while StartFFmpeg deliberately delays launching
+		// ffmpeg -- so by the time ffmpeg opens the read end and starts
+		// consuming, several seconds of data are already sitting there
+		// ready, enough to ride out the sustained ~450ms-granularity
+		// delivery pacing a real deployment showed on some CDN edges.
+		w, err := os.OpenFile(fifoPath, os.O_RDWR, 0)
 		if err != nil {
 			if ctx.Err() == nil {
-				log.Printf("[Prefetch] Failed to open fifo for writing: %v", err)
+				log.Printf("[Prefetch] Failed to open fifo: %v", err)
 			}
 			return
 		}
 		defer w.Close()
 
-		growPipeBuffer(w, prefetchPipeSize)
+		growPipeBuffer(w, pipeSize)
 
 		fetchWithResume(ctx, sourceURL, w)
 	}()
@@ -1217,14 +1255,42 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	videoInput := source
 	audioInput := audioSource
 
+	vBitrate := strings.TrimSpace(bitrate)
+	if vBitrate == "" {
+		vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
+	}
+	aBitrateStr := envOrDefault("AUDIO_BITRATE", "128k")
+	audioDelayMs := envIntOrDefault("AUDIO_DELAY_MS", 0)
+
+	// How long a real deployment needs to ride out a CDN edge that paces
+	// delivery close to real-time (observed as a sustained, growing
+	// ffmpeg-audio-read gap that plateaued around ~450-460ms per read,
+	// constant for the whole stream, independent of bitrate or whether the
+	// video/audio tracks were fetched separately or combined). Buffering
+	// this many seconds of the actual bitrate ahead of ffmpeg -- and
+	// starting ffmpeg only once buffered -- absorbs that instead of
+	// starving the encoder in real time. Costs viewers this much stream
+	// start-up latency.
+	startupBufferSeconds := envIntOrDefault("STREAM_STARTUP_BUFFER_SECONDS", 4)
+	bufferBitrateBps := parseBitrateBps(vBitrate) + parseBitrateBps(aBitrateStr)
+	prefetchPipeSize := minPrefetchPipeSize
+	if bufferBitrateBps > 0 {
+		if sized := (bufferBitrateBps / 8) * startupBufferSeconds; sized > prefetchPipeSize {
+			prefetchPipeSize = sized
+		}
+	}
+
+	prefetchStarted := false
+
 	if source != "" {
 		if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-			if pf, err := startPrefetch(source); err != nil {
+			if pf, err := startPrefetch(source, prefetchPipeSize); err != nil {
 				log.Printf("[FFmpeg] Video prefetch setup failed, reading network directly: %v", err)
 				args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
 			} else {
 				s.prefetches = append(s.prefetches, pf)
 				videoInput = pf.path
+				prefetchStarted = true
 			}
 		} else {
 			args = append(args, "-stream_loop", "-1")
@@ -1238,12 +1304,13 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		// than upscaling the low-res combined format.
 		if audioSource != "" {
 			if strings.HasPrefix(audioSource, "http://") || strings.HasPrefix(audioSource, "https://") {
-				if pf, err := startPrefetch(audioSource); err != nil {
+				if pf, err := startPrefetch(audioSource, prefetchPipeSize); err != nil {
 					log.Printf("[FFmpeg] Audio prefetch setup failed, reading network directly: %v", err)
 					args = append(args, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
 				} else {
 					s.prefetches = append(s.prefetches, pf)
 					audioInput = pf.path
+					prefetchStarted = true
 				}
 			}
 			args = append(args, "-thread_queue_size", threadQueueSize, "-fflags", "+genpts+discardcorrupt", "-re", "-i", audioInput)
@@ -1257,11 +1324,10 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 		audioMapInput = "1"
 	}
 
-	vBitrate := strings.TrimSpace(bitrate)
-	if vBitrate == "" {
-		vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
+	if prefetchStarted && startupBufferSeconds > 0 {
+		log.Printf("[FFmpeg] Buffering %ds before starting playback (pipe size %d bytes)", startupBufferSeconds, prefetchPipeSize)
+		time.Sleep(time.Duration(startupBufferSeconds) * time.Second)
 	}
-	audioDelayMs := envIntOrDefault("AUDIO_DELAY_MS", 0)
 
 	if source != "" {
 		// Cap the scale target at the source's own resolution (min(iw,w) x
@@ -1308,8 +1374,6 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	)
 
 	if source != "" {
-		aBitrate := envOrDefault("AUDIO_BITRATE", "128k")
-
 		args = append(args,
 			"-map", fmt.Sprintf("%s:a:0?", audioMapInput),
 		)
@@ -1322,7 +1386,7 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 
 		args = append(args,
 			"-c:a", "libopus",
-			"-b:a", aBitrate,
+			"-b:a", aBitrateStr,
 			"-ar", "48000",
 			"-ac", "2",
 			"-payload_type", "111",
