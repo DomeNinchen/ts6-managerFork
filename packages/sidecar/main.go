@@ -1264,9 +1264,26 @@ func (s *Sidecar) GetStats() map[string]interface{} {
 
 	peers := map[string]interface{}{}
 	for id, peer := range s.peers {
+		// remote-inbound-rtp reflects RTCP Receiver Reports sent back by the
+		// peer itself -- this is real packet loss/jitter as observed on the
+		// actual network path to that peer (the TS6 client's TeamSpeak
+		// connection, not our container's loopback), which none of the
+		// ffmpeg-side RTP-read diagnostics can see.
+		remote := map[string]interface{}{}
+		for _, stat := range peer.PC.GetStats() {
+			if rr, ok := stat.(webrtc.RemoteInboundRTPStreamStats); ok {
+				remote[rr.Kind] = map[string]interface{}{
+					"packetsLost":   rr.PacketsLost,
+					"jitter":        rr.Jitter,
+					"roundTripTime": rr.RoundTripTime,
+				}
+			}
+		}
+
 		peers[id] = map[string]interface{}{
-			"active": peer.Active,
-			"state":  peer.PC.ICEConnectionState().String(),
+			"active":           peer.Active,
+			"state":            peer.PC.ICEConnectionState().String(),
+			"remoteInboundRTP": remote,
 		}
 	}
 
